@@ -1,43 +1,75 @@
 #include <mcs51/8052.h>
-#include <stdio.h>
-#define Beep	P3_6	//Buzzer
-#define DQ		P3_7	//Data pin of the DS18B20
-#define LCD_RS	P1_0	//Register select pin of the LCD
-#define LCD_EN	P1_1	//Enable pin of the LCD
-#define LCD_D4	P1_2	//Data pins of the LCD (D4-D7)
-#define LCD_D5	P1_3
-#define LCD_D6	P1_4
-#define LCD_D7	P1_5
-unsigned char temp; 			// Current temperature
-unsigned char highest_temp;		// Highest temperature in the past minute
-unsigned char lowest_temp;		// Lowest temperature in the past minute
-unsigned char temp_history[10];	// Temperature history for the past minute
-unsigned char temp_history_index;	// Index into the temperature history buffer//Temp variable
+#include<math.h>
+#include<string.h>
+#define DQ	P3_7//Data pin of the DS18B20
+#define LCD_DATA P2
+#define EN P0_5
+#define RS P0_7
+#define RW P0_6
+//Temp variables
+unsigned char curr_temp;
+unsigned char lowest_temp_each6s = 0 , hightest_temp_each6s = 0;//update everytime read temp
+unsigned char lowest_temp_each1m = 0 , hightest_temp_each1m = 0;//update each 1 minute
+unsigned char times_read_temp = 0;//times read curr_temp:
+unsigned char first_time = 0;//first time get temp
+//after update curr_temp 6 times => update lowest_temp , hightest_temp
+unsigned char unit = 0;// convert unit C(0) <-> F(1)
 
-//Delay func (not so accurate)
-void delay_ms(unsigned int t) {
-	unsigned int i,j;
-	for(i = 0; i < t; i++)
-		for(j = 0; j < 125; j++);
+void delay_ms(unsigned int t);
+void delay_us_DS18B20(unsigned int t);
+
+void Init_DS18B20();
+unsigned char ReadByteFromScratchpad();
+void WriteByteToScratchpad(unsigned char byte);
+void ReadTemperature();
+
+void Init_System();
+void Wait_For_LCD();
+void LCD_Send_Command(unsigned char x);
+void LCD_Write_One_Char(unsigned char c);
+void LCD_Write_String(unsigned char *s);
+void LCD_Gotoxy(unsigned char x, unsigned char y);
+void Show_Tem();
+
+unsigned char C_To_F(unsigned char c);
+unsigned char F_To_C(unsigned char f);
+
+//Delay func using timer0
+void delay_ms(unsigned int s)
+{
+    unsigned int i = 0;
+    for(i = 0 ; i < s; i++)
+    {
+        //~1ms
+        TH0 = 0xFC;
+        TL0 = 0x66; // 64614 => ~1ms with f_XTAL = 11. 0592MHz
+        TF0 = 0;
+        TR0 = 1;
+        while(TF0 == 0);
+    }
+
 }
 
-//Delay func for the DS18B20 (not so accurate)
-void delay_us_DS18B20(unsigned char t) {
+//Delay func for the DS18B20 (not exactly)
+void delay_us_DS18B20(unsigned int t)
+{
     while(t--);
 }
 
-//Init for the DS18B20 -> See Init Timing in the datasheet
-void Init_DS18B20() {
+//-------DS18B20----------
+//Init for the DS18B20
+void Init_DS18B20()
+{
     DQ = 1;
-    delay_us_DS18B20(10);
+    delay_us_DS18B20(8);
     DQ = 0;					//Reset pulse ...
-    delay_us_DS18B20(150); 	//for a minimum period. See the datasheet.
+    delay_us_DS18B20(65); 	//for a minimum period. See the datasheet.
     DQ = 1;					//Rising edge
     delay_us_DS18B20(20);   //Wait for the DS18B20 to response
 }
-
 //Read a byte from the Scratchpad
-unsigned char ReadByteFromScratchpad() {
+unsigned char ReadByteFromScratchpad()
+{
     unsigned char i = 0;
     unsigned char byte = 0;
     for (i = 8; i > 0; i--){
@@ -46,28 +78,25 @@ unsigned char ReadByteFromScratchpad() {
           DQ = 1;			//The master bus releases the 1-Wire bus
           if(DQ)			//Read 1? Otherwise, Read 0
           	byte |= 0x80;
-          delay_us_DS18B20(20);
+          delay_us_DS18B20(4);
     }
     return(byte);
 }
-
 //Write a byte to the Scratchpad
-void WriteByteToScratchpad(unsigned char byte) {
+void WriteByteToScratchpad(unsigned char byte)
+{
     unsigned char i = 0;
     for (i = 8; i > 0; i--){
         DQ = 0;
         DQ = byte&0x01;
-		if(DQ)						//Write 1
-        	delay_us_DS18B20(3);
-		else						//Write 0
-			delay_us_DS18B20(20);
-        DQ = 1;	  					//The master bus releases the 1-Wire bus
+        delay_us_DS18B20(5);
+        DQ = 1;	  	//The master bus releases the 1-Wire bus
         byte >>= 1;
     }
 }
-
 //Read the DS18B20
-void ReadTemperature() {
+void ReadTemperature()
+{
     unsigned char Byte0 = 0;		//Byte0 of the Scratchpad
     unsigned char Byte1 = 0;		//Byte1 of the Scratchpad
 
@@ -80,160 +109,204 @@ void ReadTemperature() {
     WriteByteToScratchpad(0xCC);	//The master issues Skip ROM [CCh] command
     WriteByteToScratchpad(0xBE);	//Read temp value. Read Scratpad [BEh] command.
     delay_us_DS18B20(10);
+    Byte0=ReadByteFromScratchpad();	//Read Byte0 of the Scratchpad (low byte of the temp value)
+    Byte1=ReadByteFromScratchpad();	//Read Byte1 of the Scratchpad (high byte of the temp value)
 
-    Byte0 = ReadByteFromScratchpad();	//Read Byte0
-    Byte1 = ReadByteFromScratchpad();	//Read Byte1
-    temp = Byte0>>4;					//Ignore the first 4 bits
-    temp |= (Byte1<<4);					//Get the 12 bits of the temperature
+	//Calculate the temp value from Byte0 & Byte1. Then save it to the temp variable always with unit 'C
+	curr_temp = ((Byte1*256+Byte0)>>4);
+    //with F unit
+    if(unit == 1)
+    {
+        curr_temp = C_To_F(curr_temp);
+
+    }
+
+	times_read_temp++;//times update curr_temp
+	if(lowest_temp_each6s > curr_temp ) lowest_temp_each6s = curr_temp;
+	if(hightest_temp_each6s < curr_temp) hightest_temp_each6s = curr_temp;
+
+    //first time
+    if(first_time == 0)
+    {
+        lowest_temp_each1m = curr_temp;
+        lowest_temp_each6s = curr_temp;
+        hightest_temp_each1m = curr_temp;
+        hightest_temp_each6s = curr_temp;
+        first_time = 1;
+    }
+
 }
 
-//Send command to LCD
-void lcd_cmd(unsigned char cmd) {
-	LCD_RS = 0;
-	LCD_D7 = (cmd & 0x80)>>7;
-	LCD_D6 = (cmd & 0x40)>>6;
-	LCD_D5 = (cmd & 0x20)>>5;
-	LCD_D4 = (cmd & 0x10)>>4;
-	LCD_EN = 1;
+//-------LCD----------
+
+void Init_System()
+{
+    //Interupt
+    TMOD = 0x01;//module 1 for timer0
+    EA = 1;
+    EX0 = 1;//using int0 to convert temp unit
+
+    //lCD
+	RW=1;//Write mode
+
+	unit = 0;
+
+
+}
+
+void LCD_init()
+{
+	LCD_Send_Command(0x38); //8 bit, 2 lines
+	LCD_Send_Command(0x0C); //Display on, cursor off
+	LCD_Send_Command(0x01); //clear
+	LCD_Send_Command(0x80); //return home
+}
+
+//wait until LCD is ready
+void Wait_For_LCD()
+{
+	//Delay_By_Timer_0(80);
 	delay_ms(1);
-	LCD_EN = 0;
-	LCD_D7 = (cmd & 0x08)>>3;
-	LCD_D6 = (cmd & 0x04)>>2;
-	LCD_D5 = (cmd & 0x02)>>1;
-	LCD_D4 = cmd & 0x01;
-	LCD_EN = 1;
+}
+
+//send command to LCD
+void LCD_Send_Command(unsigned char x)
+{
+	LCD_DATA=x;
+	RS=0;
+	RW=0;
+	EN=1;
 	delay_ms(1);
-	LCD_EN = 0;
+	EN=0;
+	Wait_For_LCD();
+	EN=1;
 }
 
-//Send data to LCD
-void lcd_data(unsigned char data) {
-	LCD_RS = 1;
-	LCD_D7 = (data & 0x80)>>7;
-	LCD_D6 = (data & 0x40)>>6;
-	LCD_D5 = (data & 0x20)>>5;
-	LCD_D4 = (data & 0x10)>>4;
-	LCD_EN = 1;
+
+
+//display one char
+void LCD_Write_One_Char(unsigned char c)
+{
+	LCD_DATA=c;
+	RS=1;
+	RW=0;
+	EN=1;
 	delay_ms(1);
-	LCD_EN = 0;
-	LCD_D7 = (data & 0x08)>>3;
-	LCD_D6 = (data & 0x04)>>2;
-	LCD_D5 = (data & 0x02)>>1;
-	LCD_D4 = data & 0x01;
-	LCD_EN = 1;
-	delay_ms(1);
-	LCD_EN = 0;
+	EN=0;
+	Wait_For_LCD();
+	EN=1;
 }
 
-//Initialize the LCD
-void lcd_init() {
-	LCD_RS = 0;
-	LCD_EN = 0;
-	LCD_D4 = 0;
-	LCD_D5 = 0;
-	LCD_D6 = 0;
-	LCD_D7 = 0;
-	delay_ms(15);
-	lcd_cmd(0x30);
-	delay_ms(5);
-	lcd_cmd(0x30);
-	delay_ms(1);
-	lcd_cmd(0x30);
-	delay_ms(1);
-	lcd_cmd(0x20);
-	lcd_cmd(0x28);
-	lcd_cmd(0x0C);
-	lcd_cmd(0x01);
-	delay_ms(2);
-	lcd_cmd(0x06);
-}
-
-//Clear the LCD
-void lcd_clear() {
-	lcd_cmd(0x01);
-	delay_ms(2);
-}
-
-//Set cursor position on the LCD
-void lcd_gotoxy(unsigned char x, unsigned char y) {
-	unsigned char address;
-	if (y == 0) {
-		address = 0x80 + x;
-	} else {
-		address = 0xC0 + x;
-	}
-	lcd_cmd(address);
-}
-
-//Print a string on the LCD
-void lcd_puts(unsigned char *str) {
-	while (*str) {
-		lcd_data(*str++);
-	}
-}
-
-//Print the temperature on the LCD
-void lcd_put_temp(unsigned char temp) {
-	unsigned char buf[7];
-	if (temp >= 100) {
-		sprintf(buf, "%d.%dC", temp/10, temp%10);
-	} else {
-		sprintf(buf, " %d.%dC", temp/10, temp%10);
-	}
-	lcd_puts(buf);
-}
-
-void main() {
-	lcd_init();						// Initialize the LCD
-	lcd_clear();					// Clear the LCD
-	lcd_gotoxy(0,0);				// Set cursor to the first row, first column
-	lcd_puts("Temperature:");		// Print "Temperature:" on the LCD
-
-	highest_temp = 0;				// Initialize the highest temperature
-	lowest_temp = 255;				// Initialize the lowest temperature
-	temp_history_index = 0;			// Initialize the temperature history index
-	for (int i = 0; i < 10; i++) {
-		temp_history[i] = 0;		// Initialize the temperature history buffer
-	}
-
-	while(1) {
-		// Read temperature from the DS18B20
-		ReadTemperature();
-
-		// Update the temperature history buffer
-		temp_history[temp_history_index] = temp;
-		temp_history_index = (temp_history_index + 1) % 10;
-
-		// Update the highest and lowest temperature values
-		highest_temp = 0;
-		lowest_temp = 255;
-		for (int i = 0; i < 10; i++) {
-			if (temp_history[i] > highest_temp) {
-				highest_temp = temp_history[i];
-			}
-			if (temp_history[i] < lowest_temp) {
-				lowest_temp = temp_history[i];
-			}
-		}
-
-		// Display the current temperature, highest temperature, and lowest temperature
-		lcd_gotoxy(0,1);				// Set cursor to the second row, first column
-		lcd_puts("  ");					// Clear the old temperature
-		lcd_gotoxy(0,1);				// Set cursor to the second row, first column
-		lcd_put_temp(temp);				// Print the new temperature on the LCD
-		lcd_puts(" ");
-
-		lcd_gotoxy(9,0);				// Set cursor to the first row, tenth column
-		lcd_puts("   ");				// Clear the old highest temperature
-		lcd_gotoxy(9,0);				// Set cursor to the first row, tenth column
-		lcd_put_temp(highest_temp);		// Print the new highest temperature on the LCD
-
-		lcd_gotoxy(13,0);				// Set cursor to the first row, fourteenth column
-		lcd_puts("   ");				// Clear the old lowest temperature
-		lcd_gotoxy(13,0);				// Set cursor to the first row, fourteenth column
-		lcd_put_temp(lowest_temp);		// Print the new lowest temperature on the LCD
-
-		delay_ms(6000);					// Wait for 6 seconds
+//display one string
+void LCD_Write_String(unsigned char *s)
+{
+	unsigned char length;
+	length=strlen(s);
+	while(length!=0)
+	{
+		LCD_Write_One_Char(*s);
+		s++;
+		length--;
 	}
 }
 
+//move LCD cursor to (x, y)
+void LCD_Gotoxy(unsigned char x, unsigned char y){
+        unsigned char address;
+        if(!y)address=(0x80+x);
+        else address=(0xc0+x);
+        delay_us_DS18B20(1000);
+        LCD_Send_Command(address);
+        delay_us_DS18B20(50);
+}
+// display temp in LCD
+void Show_Tem()
+{
+     LCD_Gotoxy(0,0);
+     //update L and H
+     if(times_read_temp == 10)//one minute
+     {
+         //update
+         lowest_temp_each1m = lowest_temp_each6s;
+         hightest_temp_each1m = hightest_temp_each6s;
+
+         //reset
+         times_read_temp = 0;
+     }
+     //line1
+     LCD_Write_String("Cur Temp: ");
+     LCD_Write_One_Char((curr_temp%100)/10+48);//tens
+     LCD_Write_One_Char((curr_temp%10)+48);//units
+     if(unit == 0 )
+     LCD_Write_String("'C");
+     else LCD_Write_String("'F");
+     //line2
+     LCD_Send_Command(0xC0);//start in line2
+     LCD_Write_String("L:");
+     LCD_Write_One_Char((lowest_temp_each1m%100)/10+48);//tens
+     LCD_Write_One_Char((lowest_temp_each1m%10)+48);//units
+     LCD_Write_String(" H:");
+     LCD_Write_One_Char((hightest_temp_each1m%100)/10+48);//tens
+     LCD_Write_One_Char((hightest_temp_each1m%10)+48);//units
+}
+
+//convert unit
+unsigned char C_To_F(unsigned char c) {
+    float f = (c * 9 / 5.0) + 32;
+    return (unsigned char)(f + 0.5);
+}
+
+unsigned char F_To_C(unsigned char f) {
+    float c = (f - 32) * 5 / 9.0;
+    return (unsigned char)(c + 0.5);
+}
+
+void ISR0() __interrupt (0)
+{
+	EA = 0;
+	delay_ms(500);
+	unit = 1- unit;
+	if(unit == 1)
+    {
+        curr_temp = C_To_F(curr_temp);
+        lowest_temp_each1m = C_To_F(lowest_temp_each1m);
+        lowest_temp_each6s = C_To_F(lowest_temp_each6s);
+        hightest_temp_each1m = C_To_F(hightest_temp_each1m);
+        hightest_temp_each6s = C_To_F(hightest_temp_each6s);
+        Show_Tem();
+    }
+    else
+    {
+        curr_temp = F_To_C(curr_temp);
+        lowest_temp_each1m = F_To_C(lowest_temp_each1m);
+        lowest_temp_each6s = F_To_C(lowest_temp_each6s);
+        hightest_temp_each1m = F_To_C(hightest_temp_each1m);
+        hightest_temp_each6s = F_To_C(hightest_temp_each6s);
+        Show_Tem();
+    }
+	EA = 1;
+}
+
+void main()
+{
+
+    Init_System();
+	LCD_init();
+	LCD_Write_String("Taking temp...");//waiting
+    delay_ms(500);
+
+    //wait for sensor connection
+    while(1){
+        ReadTemperature();
+        if(curr_temp != 85) break;
+    }
+    times_read_temp = 0;
+    first_time = 0 ;
+    LCD_Send_Command(0x01);//clear
+	while(1){
+          LCD_Gotoxy(0,0);
+		  ReadTemperature(); 	//Read the DS18B20 ...
+		  Show_Tem();
+		  delay_ms(6000);		//for every 6s
+	}
+}
